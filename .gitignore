@@ -1,0 +1,10 @@
+.next
+node_modules
+.env
+.env.local
+coverage
+public/sw.js
+public/workbox-*.js
+storage
+prisma/migrations
+*.tsbuildinfo
