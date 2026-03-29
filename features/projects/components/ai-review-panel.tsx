@@ -28,11 +28,22 @@ interface ProjectInsightResult {
   operatorNotes: string;
 }
 
+interface OllamaProbeResult {
+  provider: "ollama";
+  baseUrl: string;
+  model: string;
+  prompt: string;
+  response: string;
+  generatedAt: string;
+}
+
 export function AiReviewPanel({ projectId }: { projectId: string }) {
   const [health, setHealth] = useState<LocalLlmHealth | null>(null);
   const [insight, setInsight] = useState<ProjectInsightResult | null>(null);
+  const [probe, setProbe] = useState<OllamaProbeResult | null>(null);
   const [isLoadingHealth, startHealthTransition] = useTransition();
   const [isGenerating, startGenerateTransition] = useTransition();
+  const [isProbing, startProbeTransition] = useTransition();
 
   useEffect(() => {
     startHealthTransition(async () => {
@@ -68,6 +79,21 @@ export function AiReviewPanel({ projectId }: { projectId: string }) {
         toast.success(payload.insight.source === "ollama" ? "Local AI review generated." : "Fallback review generated for testing.");
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Unable to generate local AI review.");
+      }
+    });
+  }
+
+  function runProbe() {
+    startProbeTransition(async () => {
+      try {
+        const payload = await clientApiFetch<OllamaProbeResult>("/api/ai/probe", {
+          method: "POST"
+        });
+
+        setProbe(payload);
+        toast.success("Ollama returned a live proof response.");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Unable to run the Ollama proof.");
       }
     });
   }
@@ -124,7 +150,7 @@ export function AiReviewPanel({ projectId }: { projectId: string }) {
           </div>
         </div>
 
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-3">
           <Button
             variant="secondary"
             onClick={generateInsights}
@@ -132,6 +158,14 @@ export function AiReviewPanel({ projectId }: { projectId: string }) {
           >
             <Sparkles className="h-4 w-4" />
             {isGenerating ? "Generating..." : health?.reachable ? "Generate local review" : "Generate fallback review"}
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={runProbe}
+            disabled={!health?.reachable || isProbing}
+          >
+            <Bot className="h-4 w-4" />
+            {isProbing ? "Probing..." : "Run Ollama proof"}
           </Button>
           <Button
             variant="ghost"
@@ -199,6 +233,26 @@ export function AiReviewPanel({ projectId }: { projectId: string }) {
             <div className="surface-muted rounded-3xl p-4">
               <div className="text-sm font-medium text-white">Operator notes</div>
               <p className="mt-2 text-sm text-slate-300">{insight.operatorNotes}</p>
+            </div>
+          </div>
+        ) : null}
+
+        {probe ? (
+          <div className="surface-muted rounded-3xl p-4">
+            <div className="flex items-center gap-2">
+              <Badge className="border-emerald-400/25 bg-emerald-400/10 text-emerald-200">Live Ollama proof</Badge>
+            </div>
+            <div className="mt-3 space-y-2 text-sm text-slate-300">
+              <div>
+                <span className="text-slate-500">Model:</span> {probe.model}
+              </div>
+              <div>
+                <span className="text-slate-500">Prompt:</span> {probe.prompt}
+              </div>
+              <div>
+                <span className="text-slate-500">Response:</span> {probe.response}
+              </div>
+              <div className="text-xs text-slate-500">Generated at {new Date(probe.generatedAt).toLocaleString()}</div>
             </div>
           </div>
         ) : null}

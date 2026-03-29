@@ -1,14 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createShotPlanner } from "@/lib/shot-planner/planner";
 import { AudioActivityAnalyzer, type AudioMetrics } from "@/lib/audio/speaker-analyzer";
+import type { ProjectDetail } from "@/lib/domain/cadris";
+import { createShotPlanner } from "@/lib/shot-planner/planner";
+import type { PlannerDecision, PlannerTimelineEvent } from "@/lib/shot-planner/types";
+import { clamp, lerp } from "@/lib/utils";
+import { VisualActivityAnalyzer } from "@/lib/vision/activity";
 import { createVisionDetector } from "@/lib/vision/detector";
 import { trackFaces } from "@/lib/vision/tracker";
-import { drawDirectorPreview, drawGuideFrame } from "@/features/live-director/lib/render";
-import type { PlannerDecision, PlannerTimelineEvent } from "@/lib/shot-planner/types";
-import type { ProjectDetail } from "@/lib/domain/cadris";
 import type { FaceTrack } from "@/lib/vision/types";
+import { drawDirectorPreview, drawGuideFrame } from "@/features/live-director/lib/render";
 
 const DEFAULT_DECISION: PlannerDecision = {
   shotType: "wide",
@@ -26,16 +28,85 @@ const DEFAULT_DECISION: PlannerDecision = {
   notes: "awaiting signal"
 };
 
+const RAW_MIME_CANDIDATES = [
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4",
+  "video/webm;codecs=vp9,opus",
+  "video/webm;codecs=vp8,opus",
+  "video/webm"
+];
+
+const DIRECTED_MIME_CANDIDATES = [
+  "video/webm;codecs=vp9,opus",
+  "video/webm;codecs=vp8,opus",
+  "video/webm",
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4"
+];
+
+interface DirectedPreviewPayload {
+  blob: Blob;
+  mimeType: string;
+}
+
+export interface LiveDirectorRuntime {
+  detectorKind: string;
+  detectorState: "idle" | "booting" | "ready" | "tracking" | "reacquiring" | "fallback";
+  detectorMessage: string;
+  audioState: "idle" | "booting" | "ready" | "active" | "suspended" | "unavailable";
+  audioMessage: string;
+  directedPreviewSupported: boolean;
+  directedPreviewState: "idle" | "supported" | "recording" | "unavailable";
+}
+
 export interface RecordedSessionPayload {
   blob: Blob;
+  directedPreview: DirectedPreviewPayload | null;
   durationMs: number;
   metadata: {
     detectorKind: string;
     maxFacesDetected: number;
     averageAudioLevel: number;
+    averageSceneMotion: number;
     sceneNotes: string[];
   };
   shotEvents: PlannerTimelineEvent[];
+}
+
+const DEFAULT_RUNTIME: LiveDirectorRuntime = {
+  detectorKind: "fallback",
+  detectorState: "idle",
+  detectorMessage: "Detector has not started yet.",
+  audioState: "idle",
+  audioMessage: "Audio analyzer has not started yet.",
+  directedPreviewSupported: false,
+  directedPreviewState: "idle"
+};
+
+function chooseRecorderMimeType(candidates: string[]) {
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
+}
+
+function decorateTracks(tracks: FaceTrack[], visualSample: ReturnType<VisualActivityAnalyzer["sample"]>): FaceTrack[] {
+  return tracks.map((track) => {
+    const metrics = visualSample.perTrack[track.id];
+    if (!metrics) {
+      return {
+        ...track,
+        activityScore: clamp(track.activityScore * 0.92, 0, 1),
+        speechScore: clamp(track.speechScore * 0.88, 0, 1),
+        presenceScore: clamp(track.presenceScore * 0.96, 0, 1)
+      };
+    }
+
+    return {
+      ...track,
+      activityScore: clamp(lerp(track.activityScore, metrics.activityScore, track.visible ? 0.62 : 0.2), 0, 1),
+      speechScore: clamp(lerp(track.speechScore, metrics.speechScore, track.visible ? 0.58 : 0.18), 0, 1),
+      presenceScore: clamp(lerp(track.presenceScore, metrics.presenceScore, 0.42), 0, 1),
+      centerBias: clamp(lerp(track.centerBias, metrics.centerBias, 0.4), 0, 1)
+    };
+  });
 }
 
 export function useLiveDirector({
@@ -49,18 +120,24 @@ export function useLiveDirector({
   const guideCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const previewCaptureStreamRef = useRef<MediaStream | null>(null);
   const audioAnalyzerRef = useRef<AudioActivityAnalyzer | null>(null);
+  const visualAnalyzerRef = useRef<VisualActivityAnalyzer | null>(null);
   const detectorKindRef = useRef("fallback");
   const detectorRef = useRef<Awaited<ReturnType<typeof createVisionDetector>> | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const directedRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const directedChunksRef = useRef<Blob[]>([]);
   const loopRef = useRef<number | null>(null);
   const plannerRef = useRef(createShotPlanner());
   const tracksRef = useRef<FaceTrack[]>([]);
   const timelineRef = useRef<PlannerTimelineEvent[]>([]);
+  const decisionRef = useRef<PlannerDecision>(DEFAULT_DECISION);
   const metricsRef = useRef({
     maxFacesDetected: 0,
     cumulativeAudioLevel: 0,
+    cumulativeSceneMotion: 0,
     sampleCount: 0
   });
   const recordStartRef = useRef<number | null>(null);
@@ -76,6 +153,14 @@ export function useLiveDirector({
     timestampMs: 0
   });
   const [facesDetected, setFacesDetected] = useState(0);
+  const [runtime, setRuntime] = useState<LiveDirectorRuntime>(DEFAULT_RUNTIME);
+
+  const disposePreviewCaptureStream = useCallback(() => {
+    previewCaptureStreamRef.current?.getTracks().forEach((track) => track.stop());
+    previewCaptureStreamRef.current = null;
+    directedRecorderRef.current = null;
+    directedChunksRef.current = [];
+  }, []);
 
   const teardown = useCallback(async () => {
     if (loopRef.current) {
@@ -85,6 +170,8 @@ export function useLiveDirector({
 
     detectorRef.current?.dispose();
     detectorRef.current = null;
+    visualAnalyzerRef.current?.dispose();
+    visualAnalyzerRef.current = null;
 
     if (audioAnalyzerRef.current) {
       await audioAnalyzerRef.current.dispose();
@@ -94,13 +181,16 @@ export function useLiveDirector({
     mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     mediaRecorderRef.current = null;
 
+    disposePreviewCaptureStream();
+
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     tracksRef.current = [];
+    timelineRef.current = [];
     recordStartRef.current = null;
     isRecordingRef.current = false;
     busyRef.current = false;
-  }, []);
+  }, [disposePreviewCaptureStream]);
 
   useEffect(() => {
     return () => {
@@ -112,6 +202,13 @@ export function useLiveDirector({
     try {
       setStatus("preparing");
       setError(null);
+      setRuntime({
+        ...DEFAULT_RUNTIME,
+        detectorState: "booting",
+        detectorMessage: "Booting face detection...",
+        audioState: "booting",
+        audioMessage: "Booting audio analyzer..."
+      });
 
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("Camera APIs are not available in this browser.");
@@ -142,15 +239,37 @@ export function useLiveDirector({
       detectorRef.current = await createVisionDetector();
       detectorKindRef.current = detectorRef.current.kind;
       audioAnalyzerRef.current = await AudioActivityAnalyzer.create(stream);
+      await audioAnalyzerRef.current.resume();
+      visualAnalyzerRef.current = new VisualActivityAnalyzer();
       plannerRef.current.reset();
       timelineRef.current = [];
+      decisionRef.current = DEFAULT_DECISION;
+      setDecision(DEFAULT_DECISION);
       metricsRef.current = {
         maxFacesDetected: 0,
         cumulativeAudioLevel: 0,
+        cumulativeSceneMotion: 0,
         sampleCount: 0
       };
       recordStartRef.current = null;
       isRecordingRef.current = false;
+      tracksRef.current = [];
+      setFacesDetected(0);
+      setRuntime({
+        detectorKind: detectorKindRef.current,
+        detectorState: "ready",
+        detectorMessage: `${detectorKindRef.current} initialized and waiting for faces.`,
+        audioState: audioAnalyzerRef.current.getState() === "running" ? "ready" : "suspended",
+        audioMessage:
+          audioAnalyzerRef.current.getState() === "running"
+            ? "Audio analyzer is listening."
+            : "Audio context is suspended. A fresh tap will resume it.",
+        directedPreviewSupported: !!previewCanvasRef.current && typeof previewCanvasRef.current.captureStream === "function",
+        directedPreviewState:
+          previewCanvasRef.current && typeof previewCanvasRef.current.captureStream === "function"
+            ? "supported"
+            : "unavailable"
+      });
 
       const tick = async (timestampMs: number) => {
         loopRef.current = requestAnimationFrame(tick);
@@ -164,19 +283,30 @@ export function useLiveDirector({
           if (!activeVideo) return;
 
           const detections = await detectorRef.current?.detect(activeVideo, timestampMs);
-          tracksRef.current = trackFaces(tracksRef.current, detections ?? [], timestampMs);
+          const trackedFaces = trackFaces(tracksRef.current, detections ?? [], timestampMs);
+          const visualSample = visualAnalyzerRef.current?.sample(activeVideo, trackedFaces) ?? {
+            sceneMotion: 0,
+            perTrack: {}
+          };
+
+          tracksRef.current = decorateTracks(trackedFaces, visualSample);
+
           const nextAudioMetrics =
             audioAnalyzerRef.current?.sample(timestampMs) ?? {
               level: 0,
               voiceActivity: 0,
               timestampMs
             };
+          const audioContextState = audioAnalyzerRef.current?.getState() ?? "suspended";
+          const hasAudioSignal = nextAudioMetrics.voiceActivity > 0.05 || nextAudioMetrics.level > 0.025;
+          const visibleFaces = tracksRef.current.filter((track) => track.visible).length;
 
           metricsRef.current.maxFacesDetected = Math.max(
             metricsRef.current.maxFacesDetected,
-            tracksRef.current.filter((track) => track.visible).length
+            visibleFaces
           );
           metricsRef.current.cumulativeAudioLevel += nextAudioMetrics.level;
+          metricsRef.current.cumulativeSceneMotion += visualSample.sceneMotion;
           metricsRef.current.sampleCount += 1;
 
           const plannerStep = plannerRef.current.next({
@@ -188,7 +318,8 @@ export function useLiveDirector({
             mode: project.mode,
             style: project.style,
             tracks: tracksRef.current,
-            audio: nextAudioMetrics
+            audio: nextAudioMetrics,
+            sceneMotion: visualSample.sceneMotion
           });
 
           if (plannerStep.timelineEvent && isRecordingRef.current && recordStartRef.current !== null) {
@@ -198,9 +329,44 @@ export function useLiveDirector({
             });
           }
 
+          decisionRef.current = plannerStep.decision;
           setDecision(plannerStep.decision);
           setAudioMetrics(nextAudioMetrics);
-          setFacesDetected(tracksRef.current.filter((track) => track.visible).length);
+          setFacesDetected(visibleFaces);
+          setRuntime((current) => ({
+            ...current,
+            detectorKind: detectorKindRef.current,
+            detectorState:
+              visibleFaces > 0
+                ? "tracking"
+                : detectorKindRef.current === "fallback"
+                  ? "fallback"
+                  : "reacquiring",
+            detectorMessage:
+              visibleFaces > 0
+                ? `${detectorKindRef.current} tracking ${visibleFaces} face${visibleFaces === 1 ? "" : "s"}.`
+                : detectorKindRef.current === "fallback"
+                  ? "No supported live face detector is available in this browser."
+                  : `${detectorKindRef.current} is running but currently reacquiring faces.`,
+            audioState:
+              audioContextState !== "running"
+                ? "suspended"
+                : hasAudioSignal
+                  ? "active"
+                  : "ready",
+            audioMessage:
+              audioContextState !== "running"
+                ? "Audio context is suspended."
+                : hasAudioSignal
+                  ? "Live audio activity detected."
+                  : "Audio analyzer is listening but the current signal is quiet.",
+            directedPreviewState:
+              directedRecorderRef.current?.state === "recording"
+                ? "recording"
+                : current.directedPreviewSupported
+                  ? "supported"
+                  : "unavailable"
+          }));
 
           if (guideCanvasRef.current) {
             drawGuideFrame(activeVideo, guideCanvasRef.current, tracksRef.current, plannerStep.decision, {
@@ -221,6 +387,13 @@ export function useLiveDirector({
     } catch (cameraError) {
       setStatus("error");
       setError(cameraError instanceof Error ? cameraError.message : "Unable to start camera.");
+      setRuntime({
+        ...DEFAULT_RUNTIME,
+        detectorState: "fallback",
+        detectorMessage: "Unable to start live detection.",
+        audioState: "unavailable",
+        audioMessage: cameraError instanceof Error ? cameraError.message : "Audio analyzer could not start."
+      });
     }
   }, [project.mode, project.style, showFaceBoxes]);
 
@@ -241,31 +414,62 @@ export function useLiveDirector({
       throw new Error("Microphone track is unavailable. Re-enable camera access and confirm microphone permission.");
     }
 
-    const preferredMimeType = [
-      "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-      "video/mp4",
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm"
-    ].find(
-      (mimeType) => MediaRecorder.isTypeSupported(mimeType)
-    );
+    await audioAnalyzerRef.current?.resume();
 
-    mediaRecorderRef.current = new MediaRecorder(streamRef.current, preferredMimeType ? { mimeType: preferredMimeType } : undefined);
+    const rawMimeType = chooseRecorderMimeType(RAW_MIME_CANDIDATES);
+    mediaRecorderRef.current = new MediaRecorder(streamRef.current, rawMimeType ? { mimeType: rawMimeType } : undefined);
     chunksRef.current = [];
+
+    const previewCanvas = previewCanvasRef.current;
+    if (previewCanvas && typeof previewCanvas.captureStream === "function") {
+      const canvasStream = previewCanvas.captureStream(30);
+      const directedStream = new MediaStream();
+      const previewVideoTrack = canvasStream.getVideoTracks()[0];
+
+      if (previewVideoTrack) {
+        directedStream.addTrack(previewVideoTrack);
+      }
+
+      for (const track of streamRef.current.getAudioTracks()) {
+        if (track.readyState === "live" && track.enabled !== false) {
+          directedStream.addTrack(track.clone());
+        }
+      }
+
+      if (directedStream.getVideoTracks().length) {
+        previewCaptureStreamRef.current = directedStream;
+        const directedMimeType = chooseRecorderMimeType(DIRECTED_MIME_CANDIDATES);
+        directedRecorderRef.current = new MediaRecorder(directedStream, directedMimeType ? { mimeType: directedMimeType } : undefined);
+        directedChunksRef.current = [];
+        directedRecorderRef.current.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            directedChunksRef.current.push(event.data);
+          }
+        };
+      }
+    }
+
+    setRuntime((current) => ({
+      ...current,
+      audioState: audioAnalyzerRef.current?.getState() === "running" ? current.audioState : "suspended",
+      audioMessage:
+        audioAnalyzerRef.current?.getState() === "running"
+          ? current.audioMessage
+          : "Audio context is suspended. Browser interaction is still required.",
+      directedPreviewSupported: !!previewCanvas && typeof previewCanvas.captureStream === "function",
+      directedPreviewState:
+        !!previewCanvas && typeof previewCanvas.captureStream === "function" ? "recording" : "unavailable"
+    }));
+
+    const initialDecision = decisionRef.current;
     timelineRef.current = [
       {
         timestampMs: 0,
-        shotType: "wide",
-        targetTrackId: null,
-        cropBox: {
-          x: 0,
-          y: 0,
-          width: 1,
-          height: 1
-        },
-        confidence: 0.25,
-        notes: "recording started"
+        shotType: initialDecision.shotType,
+        targetTrackId: initialDecision.targetTrackId,
+        cropBox: initialDecision.cropBox,
+        confidence: initialDecision.confidence,
+        notes: initialDecision.notes ?? "recording started"
       }
     ];
     recordStartRef.current = performance.now();
@@ -277,7 +481,8 @@ export function useLiveDirector({
       }
     };
 
-    mediaRecorderRef.current.start(750);
+    mediaRecorderRef.current.start(500);
+    directedRecorderRef.current?.start(500);
     setStatus("recording");
   }, []);
 
@@ -287,33 +492,70 @@ export function useLiveDirector({
     }
 
     const recorder = mediaRecorderRef.current;
+    const directedRecorder = directedRecorderRef.current?.state === "recording" ? directedRecorderRef.current : null;
+    const stoppedAt = performance.now();
+
+    if (recordStartRef.current !== null) {
+      const finalTimestampMs = Math.max(0, Math.round(stoppedAt - recordStartRef.current));
+      const lastEvent = timelineRef.current[timelineRef.current.length - 1];
+
+      if (!lastEvent || Math.abs(lastEvent.timestampMs - finalTimestampMs) > 900) {
+        timelineRef.current.push({
+          timestampMs: finalTimestampMs,
+          shotType: decisionRef.current.shotType,
+          targetTrackId: decisionRef.current.targetTrackId,
+          cropBox: decisionRef.current.cropBox,
+          confidence: decisionRef.current.confidence,
+          notes: decisionRef.current.notes
+        });
+      }
+    }
+
     isRecordingRef.current = false;
     setStatus("stopping");
 
     return new Promise<RecordedSessionPayload | null>((resolve) => {
       stopResolverRef.current = resolve;
 
-      recorder.onstop = () => {
-        const mimeType = recorder.mimeType || "video/webm";
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        const durationMs = Math.max(0, performance.now() - (recordStartRef.current ?? performance.now()));
+      let pendingStops = directedRecorder ? 2 : 1;
+      let rawBlob: Blob | null = null;
+      let directedPreview: DirectedPreviewPayload | null = null;
+
+      const finalize = () => {
+        pendingStops -= 1;
+        if (pendingStops > 0 || !rawBlob) {
+          return;
+        }
+
+        const durationMs = Math.max(0, stoppedAt - (recordStartRef.current ?? stoppedAt));
         const averageAudioLevel =
           metricsRef.current.sampleCount > 0 ? metricsRef.current.cumulativeAudioLevel / metricsRef.current.sampleCount : 0;
+        const averageSceneMotion =
+          metricsRef.current.sampleCount > 0 ? metricsRef.current.cumulativeSceneMotion / metricsRef.current.sampleCount : 0;
 
         setStatus("ready");
         recordStartRef.current = null;
+        mediaRecorderRef.current = null;
+        disposePreviewCaptureStream();
+        setRuntime((current) => ({
+          ...current,
+          directedPreviewState: current.directedPreviewSupported ? "supported" : "unavailable"
+        }));
 
         stopResolverRef.current?.({
-          blob,
+          blob: rawBlob,
+          directedPreview,
           durationMs,
           metadata: {
             detectorKind: detectorKindRef.current,
             maxFacesDetected: metricsRef.current.maxFacesDetected,
             averageAudioLevel,
+            averageSceneMotion,
             sceneNotes: [
               `mode:${project.mode}`,
               `style:${project.style}`,
-              `detector:${detectorKindRef.current}`
+              `detector:${detectorKindRef.current}`,
+              `preview:${directedPreview ? "captured" : "unavailable"}`
             ]
           },
           shotEvents: timelineRef.current
@@ -321,13 +563,40 @@ export function useLiveDirector({
         stopResolverRef.current = null;
       };
 
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || "video/webm";
+        rawBlob = new Blob(chunksRef.current, { type: mimeType });
+        finalize();
+      };
+
+      if (directedRecorder) {
+        directedRecorder.onstop = () => {
+          const mimeType = directedRecorder.mimeType || "video/webm";
+          directedPreview =
+            directedChunksRef.current.length > 0
+              ? {
+                  blob: new Blob(directedChunksRef.current, { type: mimeType }),
+                  mimeType
+                }
+              : null;
+          finalize();
+        };
+      }
+
       try {
         recorder.requestData();
       } catch {}
 
+      if (directedRecorder) {
+        try {
+          directedRecorder.requestData();
+        } catch {}
+      }
+
       recorder.stop();
+      directedRecorder?.stop();
     });
-  }, [project.mode, project.style]);
+  }, [disposePreviewCaptureStream, project.mode, project.style]);
 
   return {
     videoRef,
@@ -338,6 +607,7 @@ export function useLiveDirector({
     decision,
     audioMetrics,
     facesDetected,
+    runtime,
     startCamera,
     startRecording,
     stopRecording,

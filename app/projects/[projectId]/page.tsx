@@ -73,6 +73,18 @@ export default async function ProjectReviewPage({
           <CardContent className="space-y-4">
             {latestRecording ? (
               <div className="space-y-4">
+                {latestRecording.directedPreviewVideoUrl ? (
+                  <div className="surface-muted rounded-3xl p-4">
+                    <div className="mb-3 text-sm font-medium text-slate-200">Saved directed preview</div>
+                    <video
+                      src={withApiBaseUrl(latestRecording.directedPreviewVideoUrl)}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      className="aspect-video w-full rounded-[24px] object-cover"
+                    />
+                  </div>
+                ) : null}
                 <DirectedSessionPlayer
                   recordingUrl={withApiBaseUrl(latestRecording.originalVideoUrl)}
                   durationMs={latestRecording.durationMs}

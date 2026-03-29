@@ -10,7 +10,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const isLiveCameraScreen = pathname.startsWith("/record/") && pathname !== "/record/new";
 
   return (
-    <div className="min-h-dvh pb-24">
+    <div className={cn("min-h-dvh", isLiveCameraScreen ? "h-dvh overflow-hidden pb-0" : "pb-24")}>
       {!isLiveCameraScreen ? (
         <header className="sticky top-0 z-40 px-4 pb-3 pt-[max(env(safe-area-inset-top),0.75rem)]">
           <div className="surface-panel mx-auto mt-3 flex max-w-6xl items-center justify-between rounded-full px-4 py-3">
@@ -24,12 +24,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <main
         className={cn(
           "mx-auto max-w-6xl px-4 pb-8",
-          isLiveCameraScreen ? "pt-[max(env(safe-area-inset-top),0.75rem)]" : "pt-2"
+          isLiveCameraScreen
+            ? "h-dvh max-w-none px-0 pb-0 pt-0 overflow-hidden"
+            : "pt-2"
         )}
       >
         {children}
       </main>
-      <MobileNav />
+      {!isLiveCameraScreen ? <MobileNav /> : null}
     </div>
   );
 }

@@ -15,6 +15,7 @@ export interface PlannerInput {
   style: FramingStyle;
   tracks: FaceTrack[];
   audio: AudioMetrics;
+  sceneMotion: number;
 }
 
 export interface PlannerDecision {

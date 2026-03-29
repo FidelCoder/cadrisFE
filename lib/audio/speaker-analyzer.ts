@@ -6,6 +6,14 @@ export interface AudioMetrics {
   timestampMs: number;
 }
 
+type AudioContextConstructor = typeof AudioContext;
+
+declare global {
+  interface Window {
+    webkitAudioContext?: AudioContextConstructor;
+  }
+}
+
 export class AudioActivityAnalyzer {
   private readonly context: AudioContext;
   private readonly analyser: AnalyserNode;
@@ -21,7 +29,14 @@ export class AudioActivityAnalyzer {
   }
 
   static async create(stream: MediaStream) {
-    const context = new AudioContext();
+    const AudioContextClass =
+      typeof window !== "undefined" ? (window.AudioContext || window.webkitAudioContext) : undefined;
+
+    if (!AudioContextClass) {
+      throw new Error("Web Audio is not available in this browser.");
+    }
+
+    const context = new AudioContextClass();
     const source = context.createMediaStreamSource(stream);
     const analyser = context.createAnalyser();
     analyser.fftSize = 1024;
@@ -29,7 +44,19 @@ export class AudioActivityAnalyzer {
 
     source.connect(analyser);
 
-    return new AudioActivityAnalyzer(context, analyser, source);
+    const analyzer = new AudioActivityAnalyzer(context, analyser, source);
+    await analyzer.resume();
+    return analyzer;
+  }
+
+  getState() {
+    return this.context.state;
+  }
+
+  async resume() {
+    if (this.context.state === "suspended") {
+      await this.context.resume();
+    }
   }
 
   sample(timestampMs: number): AudioMetrics {

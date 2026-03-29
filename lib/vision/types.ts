@@ -18,6 +18,10 @@ export interface FaceTrack {
   lastSeenAt: number;
   firstSeenAt: number;
   motionScore: number;
+  activityScore: number;
+  speechScore: number;
+  presenceScore: number;
+  centerBias: number;
   velocity: Point2D;
   stability: number;
   visible: boolean;

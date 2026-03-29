@@ -23,6 +23,24 @@ interface BlazeFacePrediction {
   probability?: number | number[] | Float32Array;
 }
 
+function getOverlapRatio(
+  left: Pick<DetectedFace["box"], "x" | "y" | "width" | "height">,
+  right: Pick<DetectedFace["box"], "x" | "y" | "width" | "height">
+) {
+  const intersectionLeft = Math.max(left.x, right.x);
+  const intersectionTop = Math.max(left.y, right.y);
+  const intersectionRight = Math.min(left.x + left.width, right.x + right.width);
+  const intersectionBottom = Math.min(left.y + left.height, right.y + right.height);
+
+  if (intersectionRight <= intersectionLeft || intersectionBottom <= intersectionTop) {
+    return 0;
+  }
+
+  const intersectionArea = (intersectionRight - intersectionLeft) * (intersectionBottom - intersectionTop);
+  const smallerArea = Math.max(1, Math.min(left.width * left.height, right.width * right.height));
+  return intersectionArea / smallerArea;
+}
+
 class NativeFaceDetectionAdapter implements VisionDetector {
   kind = "native-face-detector" as const;
 
@@ -56,28 +74,47 @@ class BlazeFaceDetectionAdapter implements VisionDetector {
   async detect(video: HTMLVideoElement, timestampMs: number) {
     const predictions = await this.estimateFaces(video);
 
-    return predictions.slice(0, 4).map((prediction, index) => {
-      const topLeftX = Number(prediction.topLeft[0]);
-      const topLeftY = Number(prediction.topLeft[1]);
-      const bottomRightX = Number(prediction.bottomRight[0]);
-      const bottomRightY = Number(prediction.bottomRight[1]);
-      const probability = Array.isArray(prediction.probability)
-        ? Number(prediction.probability[0] ?? 0.78)
-        : prediction.probability instanceof Float32Array
+    const detections = predictions
+      .map((prediction, index) => {
+        const topLeftX = Number(prediction.topLeft[0]);
+        const topLeftY = Number(prediction.topLeft[1]);
+        const bottomRightX = Number(prediction.bottomRight[0]);
+        const bottomRightY = Number(prediction.bottomRight[1]);
+        const probability = Array.isArray(prediction.probability)
           ? Number(prediction.probability[0] ?? 0.78)
-          : Number(prediction.probability ?? 0.78);
+          : prediction.probability instanceof Float32Array
+            ? Number(prediction.probability[0] ?? 0.78)
+            : Number(prediction.probability ?? 0.78);
 
-      return {
-        detectionId: `${timestampMs}-blazeface-${index}`,
-        confidence: clamp(probability || 0.78, 0.4, 1),
-        box: {
-          x: topLeftX,
-          y: topLeftY,
-          width: Math.max(1, bottomRightX - topLeftX),
-          height: Math.max(1, bottomRightY - topLeftY)
-        }
-      };
-    });
+        return {
+          detectionId: `${timestampMs}-blazeface-${index}`,
+          confidence: clamp(probability || 0.78, 0.4, 1),
+          box: {
+            x: clamp(topLeftX, 0, video.videoWidth),
+            y: clamp(topLeftY, 0, video.videoHeight),
+            width: clamp(bottomRightX - topLeftX, video.videoWidth * 0.04, video.videoWidth),
+            height: clamp(bottomRightY - topLeftY, video.videoHeight * 0.06, video.videoHeight)
+          }
+        };
+      })
+      .sort((left, right) => right.confidence - left.confidence);
+
+    const deduped: DetectedFace[] = [];
+    for (const detection of detections) {
+      if (deduped.some((existing) => getOverlapRatio(existing.box, detection.box) > 0.74)) {
+        continue;
+      }
+
+      deduped.push(detection);
+      if (deduped.length >= 4) {
+        break;
+      }
+    }
+
+    return deduped.map((detection, index) => ({
+      ...detection,
+      detectionId: `${timestampMs}-blazeface-${index}`
+    }));
   }
 
   dispose() {}
@@ -245,12 +282,16 @@ class FallbackDetectionAdapter implements VisionDetector {
 
 export async function createVisionDetector(): Promise<VisionDetector> {
   if (typeof window !== "undefined" && window.FaceDetector) {
-    return new NativeFaceDetectionAdapter(
-      new window.FaceDetector({
-        fastMode: true,
-        maxDetectedFaces: 4
-      })
-    );
+    try {
+      return new NativeFaceDetectionAdapter(
+        new window.FaceDetector({
+          fastMode: true,
+          maxDetectedFaces: 4
+        })
+      );
+    } catch (error) {
+      console.warn("Falling back from native FaceDetector.", error);
+    }
   }
 
   if (typeof window !== "undefined") {

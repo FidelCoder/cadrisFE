@@ -45,10 +45,10 @@ export function trackFaces(previousTracks: FaceTrack[], detections: DetectedFace
       const matchedTrack = remainingTracks.splice(matchedTrackIndex, 1)[0];
       const previousCenter = getCenter(matchedTrack.box);
       const smoothedBox = {
-        x: lerp(matchedTrack.box.x, detection.box.x, 0.58),
-        y: lerp(matchedTrack.box.y, detection.box.y, 0.58),
-        width: lerp(matchedTrack.box.width, detection.box.width, 0.52),
-        height: lerp(matchedTrack.box.height, detection.box.height, 0.52)
+        x: lerp(matchedTrack.box.x, detection.box.x, 0.52),
+        y: lerp(matchedTrack.box.y, detection.box.y, 0.52),
+        width: lerp(matchedTrack.box.width, detection.box.width, 0.46),
+        height: lerp(matchedTrack.box.height, detection.box.height, 0.46)
       };
       const smoothedCenter = getCenter(smoothedBox);
       const distance = getDistance(previousCenter, detectionCenter);
@@ -57,7 +57,7 @@ export function trackFaces(previousTracks: FaceTrack[], detections: DetectedFace
       nextTracks.push({
         ...matchedTrack,
         box: smoothedBox,
-        confidence: clamp(matchedTrack.confidence * 0.45 + detection.confidence * 0.55, 0, 1),
+        confidence: clamp(matchedTrack.confidence * 0.42 + detection.confidence * 0.58, 0, 1),
         lastSeenAt: timestampMs,
         motionScore: clamp(distance / Math.max(boxSize, 1), 0, 1),
         stability: estimateStability(distance, boxSize),
@@ -75,6 +75,10 @@ export function trackFaces(previousTracks: FaceTrack[], detections: DetectedFace
         lastSeenAt: timestampMs,
         firstSeenAt: timestampMs,
         motionScore: 0,
+        activityScore: 0,
+        speechScore: 0,
+        presenceScore: 0,
+        centerBias: 0.5,
         velocity: { x: 0, y: 0 },
         stability: 0.45,
         visible: true
@@ -88,6 +92,9 @@ export function trackFaces(previousTracks: FaceTrack[], detections: DetectedFace
         ...track,
         visible: false,
         motionScore: 0,
+        activityScore: clamp(track.activityScore * 0.88, 0, 1),
+        speechScore: clamp(track.speechScore * 0.82, 0, 1),
+        presenceScore: clamp(track.presenceScore * 0.94, 0, 1),
         stability: clamp(track.stability - 0.05, 0, 1)
       });
     }
