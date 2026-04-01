@@ -23,6 +23,40 @@ interface BlazeFacePrediction {
   probability?: number | number[] | Float32Array;
 }
 
+function normalizeDetectionBox(
+  video: HTMLVideoElement,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  paddingRatio = 0.08
+) {
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
+  const paddingX = width * paddingRatio;
+  const paddingY = height * paddingRatio;
+
+  return {
+    x: clamp(left - paddingX, 0, video.videoWidth),
+    y: clamp(top - paddingY, 0, video.videoHeight),
+    width: clamp(width + paddingX * 2, video.videoWidth * 0.04, video.videoWidth),
+    height: clamp(height + paddingY * 2, video.videoHeight * 0.06, video.videoHeight)
+  };
+}
+
+function isPlausibleFaceBox(video: HTMLVideoElement, box: DetectedFace["box"]) {
+  const aspectRatio = box.width / Math.max(box.height, 1);
+  const relativeArea = (box.width * box.height) / Math.max(video.videoWidth * video.videoHeight, 1);
+
+  return (
+    box.width >= video.videoWidth * 0.035 &&
+    box.height >= video.videoHeight * 0.05 &&
+    aspectRatio > 0.45 &&
+    aspectRatio < 1.8 &&
+    relativeArea < 0.4
+  );
+}
+
 function getOverlapRatio(
   left: Pick<DetectedFace["box"], "x" | "y" | "width" | "height">,
   right: Pick<DetectedFace["box"], "x" | "y" | "width" | "height">
@@ -49,16 +83,20 @@ class NativeFaceDetectionAdapter implements VisionDetector {
   async detect(video: HTMLVideoElement, timestampMs: number) {
     const detections = await this.detector.detect(video);
 
-    return detections.map((detection, index) => ({
-      detectionId: `${timestampMs}-${index}`,
-      confidence: 0.8,
-      box: {
-        x: detection.boundingBox.x,
-        y: detection.boundingBox.y,
-        width: detection.boundingBox.width,
-        height: detection.boundingBox.height
-      }
-    }));
+    return detections
+      .map((detection, index) => ({
+        detectionId: `${timestampMs}-${index}`,
+        confidence: 0.8,
+        box: normalizeDetectionBox(
+          video,
+          detection.boundingBox.x,
+          detection.boundingBox.y,
+          detection.boundingBox.x + detection.boundingBox.width,
+          detection.boundingBox.y + detection.boundingBox.height,
+          0.04
+        )
+      }))
+      .filter((detection) => isPlausibleFaceBox(video, detection.box));
   }
 
   dispose() {}
@@ -88,15 +126,11 @@ class BlazeFaceDetectionAdapter implements VisionDetector {
 
         return {
           detectionId: `${timestampMs}-blazeface-${index}`,
-          confidence: clamp(probability || 0.78, 0.4, 1),
-          box: {
-            x: clamp(topLeftX, 0, video.videoWidth),
-            y: clamp(topLeftY, 0, video.videoHeight),
-            width: clamp(bottomRightX - topLeftX, video.videoWidth * 0.04, video.videoWidth),
-            height: clamp(bottomRightY - topLeftY, video.videoHeight * 0.06, video.videoHeight)
-          }
+          confidence: clamp(probability || 0.74, 0.32, 1),
+          box: normalizeDetectionBox(video, topLeftX, topLeftY, bottomRightX, bottomRightY)
         };
       })
+      .filter((detection) => isPlausibleFaceBox(video, detection.box))
       .sort((left, right) => right.confidence - left.confidence);
 
     const deduped: DetectedFace[] = [];
@@ -313,7 +347,7 @@ export async function createVisionDetector(): Promise<VisionDetector> {
 
       const model = await blazeface.load({
         maxFaces: 4,
-        scoreThreshold: 0.45,
+        scoreThreshold: 0.32,
         iouThreshold: 0.2
       });
 

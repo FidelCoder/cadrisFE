@@ -29,11 +29,11 @@ const DEFAULT_DECISION: PlannerDecision = {
 };
 
 const RAW_MIME_CANDIDATES = [
-  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-  "video/mp4",
   "video/webm;codecs=vp9,opus",
   "video/webm;codecs=vp8,opus",
-  "video/webm"
+  "video/webm",
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4"
 ];
 
 const DIRECTED_MIME_CANDIDATES = [
@@ -120,6 +120,7 @@ export function useLiveDirector({
   const guideCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
   const previewCaptureStreamRef = useRef<MediaStream | null>(null);
   const audioAnalyzerRef = useRef<AudioActivityAnalyzer | null>(null);
   const visualAnalyzerRef = useRef<VisualActivityAnalyzer | null>(null);
@@ -162,6 +163,13 @@ export function useLiveDirector({
     directedChunksRef.current = [];
   }, []);
 
+  const disposeRecordingStream = useCallback(() => {
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    chunksRef.current = [];
+  }, []);
+
   const teardown = useCallback(async () => {
     if (loopRef.current) {
       cancelAnimationFrame(loopRef.current);
@@ -178,8 +186,7 @@ export function useLiveDirector({
       audioAnalyzerRef.current = null;
     }
 
-    mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
-    mediaRecorderRef.current = null;
+    disposeRecordingStream();
 
     disposePreviewCaptureStream();
 
@@ -190,7 +197,7 @@ export function useLiveDirector({
     recordStartRef.current = null;
     isRecordingRef.current = false;
     busyRef.current = false;
-  }, [disposePreviewCaptureStream]);
+  }, [disposePreviewCaptureStream, disposeRecordingStream]);
 
   useEffect(() => {
     return () => {
@@ -416,8 +423,33 @@ export function useLiveDirector({
 
     await audioAnalyzerRef.current?.resume();
 
+    const recordingStream = new MediaStream();
+    const recordingVideoTrack = streamRef.current.getVideoTracks()[0]?.clone() ?? null;
+    const recordingAudioTrack =
+      audioAnalyzerRef.current?.createRecordingTrack() ??
+      streamRef.current.getAudioTracks()[0]?.clone() ??
+      null;
+
+    if (!recordingAudioTrack) {
+      setRuntime((current) => ({
+        ...current,
+        audioState: "unavailable",
+        audioMessage: "Microphone track could not be prepared for recording."
+      }));
+      throw new Error("Microphone track could not be prepared for recording. Re-enable camera and microphone access.");
+    }
+
+    if (recordingVideoTrack) {
+      recordingStream.addTrack(recordingVideoTrack);
+    }
+
+    if (recordingAudioTrack) {
+      recordingStream.addTrack(recordingAudioTrack);
+    }
+
     const rawMimeType = chooseRecorderMimeType(RAW_MIME_CANDIDATES);
-    mediaRecorderRef.current = new MediaRecorder(streamRef.current, rawMimeType ? { mimeType: rawMimeType } : undefined);
+    recordingStreamRef.current = recordingStream;
+    mediaRecorderRef.current = new MediaRecorder(recordingStream, rawMimeType ? { mimeType: rawMimeType } : undefined);
     chunksRef.current = [];
 
     const previewCanvas = previewCanvasRef.current;
@@ -430,10 +462,13 @@ export function useLiveDirector({
         directedStream.addTrack(previewVideoTrack);
       }
 
-      for (const track of streamRef.current.getAudioTracks()) {
-        if (track.readyState === "live" && track.enabled !== false) {
-          directedStream.addTrack(track.clone());
-        }
+      const directedAudioTrack =
+        audioAnalyzerRef.current?.createRecordingTrack() ??
+        streamRef.current.getAudioTracks()[0]?.clone() ??
+        null;
+
+      if (directedAudioTrack) {
+        directedStream.addTrack(directedAudioTrack);
       }
 
       if (directedStream.getVideoTracks().length) {
@@ -451,10 +486,12 @@ export function useLiveDirector({
 
     setRuntime((current) => ({
       ...current,
-      audioState: audioAnalyzerRef.current?.getState() === "running" ? current.audioState : "suspended",
+      audioState: audioAnalyzerRef.current?.getState() === "running" ? "ready" : "suspended",
       audioMessage:
         audioAnalyzerRef.current?.getState() === "running"
-          ? current.audioMessage
+          ? recordingAudioTrack
+            ? "Audio analyzer is running and the recording track is armed."
+            : "Audio analyzer is running, but the recording track could not be prepared."
           : "Audio context is suspended. Browser interaction is still required.",
       directedPreviewSupported: !!previewCanvas && typeof previewCanvas.captureStream === "function",
       directedPreviewState:
@@ -481,7 +518,7 @@ export function useLiveDirector({
       }
     };
 
-    mediaRecorderRef.current.start(500);
+    mediaRecorderRef.current.start(250);
     directedRecorderRef.current?.start(500);
     setStatus("recording");
   }, []);
@@ -535,7 +572,7 @@ export function useLiveDirector({
 
         setStatus("ready");
         recordStartRef.current = null;
-        mediaRecorderRef.current = null;
+        disposeRecordingStream();
         disposePreviewCaptureStream();
         setRuntime((current) => ({
           ...current,
@@ -596,7 +633,7 @@ export function useLiveDirector({
       recorder.stop();
       directedRecorder?.stop();
     });
-  }, [disposePreviewCaptureStream, project.mode, project.style]);
+  }, [disposePreviewCaptureStream, disposeRecordingStream, project.mode, project.style]);
 
   return {
     videoRef,

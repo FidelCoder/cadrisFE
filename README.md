@@ -12,13 +12,15 @@ Mobile-first Next.js 15 PWA for Cadris, a real-time AI camera director that help
 - In-browser face tracking abstraction, audio activity analysis, and shot planner
 - Project library, review screen, export preview screen
 - Zustand-based client preferences
+- Runtime visibility panel for backend/storage/LLM deployment checks
 
 ## Local setup
 
 1. Copy `.env.example` to `.env.local`.
 2. Set `NEXT_PUBLIC_API_BASE_URL` to the backend URL.
-3. Install dependencies with `npm install`.
-4. Run `npm run dev`.
+3. Optionally set `NEXT_PUBLIC_APP_ENV` and `NEXT_PUBLIC_APP_VERSION` so the Settings screen reflects the active deployment.
+4. Install dependencies with `npm install`.
+5. Run `npm run dev`.
 
 Default local URLs:
 
@@ -33,6 +35,7 @@ Default local URLs:
 - Export is intentionally lightweight for v1 and leans on the saved directed preview plus shot metadata rather than a heavyweight final renderer.
 - The frontend assumes the backend owns persistence, media storage, and export-preview generation.
 - A local AI review panel is available on the project review screen when the backend can reach an Ollama-compatible runtime.
+- The Settings screen includes runtime checks so beta operators can confirm backend health, storage mode, and local LLM status without leaving the app.
 
 ## Main flows
 
